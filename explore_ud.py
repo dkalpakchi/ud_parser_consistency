@@ -1,5 +1,7 @@
 import argparse
 import re
+import os
+import glob
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -13,53 +15,30 @@ from udon2.visual import render_dep_tree
 from udon2.kernels import ConvPartialTreeKernel
 
 
-def is_identical(r1, r2):
-    if r1.is_identical(r2, "") and str(r1.children) == str(r2.children):
-        all_identical = True
-        for c1, c2 in zip(r1.children, r2.children):
-            all_identical = all_identical and is_identical(c1, c2)
-            if not all_identical:
-                return all_identical
-        return all_identical
-    else:
-        return False
-
-
-def nodelist2string(lst):
-    return " ".join(["|".join([n.upos, n.deprel]) for n in lst])
-
-
-def is_identical_except_form_and_lemma(r1, r2):
-    if r1.is_identical(r2, "form,lemma") and nodelist2string(r1.children) == nodelist2string(r2.children):
-        all_identical = True
-        for c1, c2 in zip(r1.children, r2.children):
-            all_identical = all_identical and is_identical_except_form_and_lemma(c1, c2)
-            if not all_identical:
-                return all_identical
-        return all_identical
-    else:
-        return False
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-t', '--treebank', type=str, required=True, help="A path to UD treebank")
-    parser.add_argument('-l', '--language', type=str, default='en', help="Language")
+    parser.add_argument('-l', '--language', type=str, required=True, help="Language")
+    parser.add_argument('-ap', '--augmented-parser', action='store_true')
     args = parser.parse_args()
 
+    base_dir = '/home/dmytro/oss/stanza/saved_models'
+
     dep_proc = 'tokenize,lemma,mwt,pos,depparse' if args.language in ['fi', 'ar'] else 'tokenize,lemma,pos,depparse'
-    ud_parser = stanza.Pipeline(
-        lang=args.language, processors=dep_proc
-        # tokenize_model_path='saved_models/tokenize/sv_talbanken_tokenizer.pt',
-        # depparse_model_path='saved_models/depparse/sv_talbanken_tokenizer.pt',
-        # pos_model_path='saved_models/pos/sv_talbanken_tokenizer.pt',
-        # lemma_model_path='saved_models/lemma/sv_talbanken_tokenizer.pt'
-    )
+    if args.augmented_parser:
+        ud_parser = stanza.Pipeline(
+            lang=args.language, processors=dep_proc,
+            tokenize_model_path=glob.glob(os.path.join(base_dir, 'tokenize', '{}_*_tokenizer.pt'.format(args.language)))[0],
+            depparse_model_path=glob.glob(os.path.join(base_dir, 'depparse', '{}_*_parser.pt'.format(args.language)))[0],
+            pos_model_path=glob.glob(os.path.join(base_dir, 'pos', '{}_*_tagger.pt'.format(args.language)))[0],
+            lemma_model_path=glob.glob(os.path.join(base_dir, 'lemma', '{}_*_lemmatizer.pt'.format(args.language)))[0]
+        )
+    else:
+        ud_parser = stanza.Pipeline(lang=args.language, processors=dep_proc)
 
     prefix = Path(args.treebank).stem
 
     YEAR = re.compile(r"(?<= )\d{4}(?= )")
-    YEAR_EN = re.compile(r"(?<= )\d{4}(?= year)|(?<=year )\d{4}(?= )")
 
     kernel = ConvPartialTreeKernel("GRCT", includeFeats=True, includeForm=False)
 
@@ -83,7 +62,8 @@ if __name__ == '__main__':
             'corr_parsed': 0,
             'gold': udon2.TreeList(),
             'parsed': udon2.TreeList(),
-            'wrong_sent_segm': 0
+            'wrong_sent_segm': 0,
+            'conv_tree_kernels': []
         },
         'augmented': {
             'total': 0,
@@ -99,7 +79,15 @@ if __name__ == '__main__':
         }
     }
 
-    for f, match in finalists:
+    results_dir = '{}_results'.format(prefix)
+    if not os.path.exists(results_dir):
+        os.mkdir(results_dir)
+
+    batches_dir = os.path.join(results_dir, '{}_batches'.format(prefix))
+    if not os.path.exists(batches_dir):
+        os.mkdir(batches_dir)
+
+    for batch_id, (f, match) in enumerate(finalists):
         sentence = f.get_subtree_text()
         trees = udon2.Importer.from_stanza(ud_parser(sentence).to_dict())
 
@@ -111,13 +99,16 @@ if __name__ == '__main__':
 
         r['original']['gold'].append(f)
         r['original']['parsed'].append(tree)
-        original_identical = is_identical(f, tree)
+        f_norm, t_norm = kernel(f, f), kernel(tree, tree)
+        original_kernel = float(round(kernel(f, tree) / ( np.sqrt(f_norm) * np.sqrt(t_norm) ), 4))
+        original_identical = original_kernel == 1
         r['original']['corr_parsed'] += original_identical
+        r['original']['conv_tree_kernels'].append(original_kernel)
 
         s, e = match.span()
 
         current_year = sentence[s:e]
-        first, f1 = f.copy(), f.copy()
+        first, f1 = None, f.copy()
         batch = {
             'total': 0,
             'corr_parsed': 0,
@@ -127,9 +118,12 @@ if __name__ == '__main__':
             'upos': defaultdict(lambda: defaultdict(int)),
             'deprel': defaultdict(lambda: defaultdict(int)),
             'feats': defaultdict(lambda: defaultdict(int)),
-            'conv_kernel_matrix': np.zeros((K, K))
+            'conv_kernel_matrix': None, # TBI later
+            'conv_kernel_gold': []
         }
         batch_parsed_trees = udon2.TreeList()
+        f1_norm = kernel(f1, f1)
+        precomputed_norms = {} # for conv tree kernels
         for y in years:
             nodes = f1.select_by('form', current_year)
             y_str = str(y)
@@ -156,13 +150,17 @@ if __name__ == '__main__':
             else:
                 tree = trees[0]
 
-            trees_identical = is_identical(f1, tree)
+            if not first:
+                first = tree.copy()
+
+            precomputed_norms[batch['total']-batch['wrong_sent_segm']-1] = kernel(tree, tree)
+
+            norm = np.sqrt(f1_norm) * np.sqrt(precomputed_norms[batch['total']-batch['wrong_sent_segm']-1])
+            trees_kernel = round( float(kernel(f1, tree) / norm), 4 )
+            trees_identical = trees_kernel == 1
             r['augmented']['corr_parsed'] += trees_identical
             batch['corr_parsed'] += trees_identical
-
-            same_as_first = is_identical_except_form_and_lemma(first, tree)
-            r['augmented']['same_as_first'] += same_as_first
-            batch['same_as_first'] += same_as_first
+            batch['conv_kernel_gold'].append(trees_kernel)
 
             r['augmented']['gold'].append(f1.copy())
             r['augmented']['parsed'].append(tree)
@@ -180,35 +178,39 @@ if __name__ == '__main__':
                 batch['deprel'][n1.deprel][n2.deprel] += 1
                 batch['feats'][str(n1.feats)][str(n2.feats)] += 1
 
-        if batch['original_match']:
-            del batch['conv_kernel_matrix']
-        else:
-            NB = len(batch_parsed_trees)
-            if NB != K:
-                batch['conv_kernel_matrix'] = np.zeros((NB, NB))
-            precomputed_norms = {}
-            for i in range(NB):
-                for j in range(i, NB):
-                    # if i == j:
-                    #     batch['conv_kernel_matrix'][i][j] = 1.0
-                    # else:
+        # if batch['original_match']:
+        #     del batch['conv_kernel_matrix']
+        # else:
+        NB = len(batch_parsed_trees)
+        batch['conv_kernel_matrix'] = np.zeros((NB, NB))
+        for i in range(NB):
+            for j in range(i, NB):
+                if i == j:
+                    batch['conv_kernel_matrix'][i][j] = 1.0
+                else:
                     t1, t2 = batch_parsed_trees[i], batch_parsed_trees[j]
-                    if i not in precomputed_norms:
-                        precomputed_norms[i] = kernel(t1, t1)
-                    if j not in precomputed_norms:
-                        precomputed_norms[j] = kernel(t2, t2)
-                    
-                    batch['conv_kernel_matrix'][i][j] = round(kernel(t1, t2) / (np.sqrt(precomputed_norms[i]) * np.sqrt(precomputed_norms[j])), 4)
-            batch['conv_kernel_matrix'] = batch['conv_kernel_matrix'].tolist()
-
+                    ck = kernel(t1, t2)
+                    if np.isfinite(ck) and np.isfinite(precomputed_norms[i]) and np.isfinite(precomputed_norms[j]):
+                        batch['conv_kernel_matrix'][i][j] = round(
+                            float(ck / (np.sqrt(precomputed_norms[i]) * np.sqrt(precomputed_norms[j]))), 4)
+                    else:
+                        batch['conv_kernel_matrix'][i][j] = -1
+        same_as_first_cnt = int(sum(batch['conv_kernel_matrix'][0][1:] == 1))
+        r['augmented']['same_as_first'] += same_as_first_cnt
+        batch['same_as_first'] += same_as_first_cnt
+        batch['conv_kernel_matrix'] = batch['conv_kernel_matrix'].tolist()
+        
+        udon2.ConllWriter.write_to_file(batch_parsed_trees, os.path.join(
+            batches_dir, "{}_augmented_parsed_b{}.conllu".format(prefix, batch_id)
+        ))
         r['augmented']['batches'].append(batch)
 
     ind, outd = r['original'], r['augmented']
-    udon2.ConllWriter.write_to_file(ind['gold'], "{}_original_gold.conllu".format(prefix))
-    udon2.ConllWriter.write_to_file(ind['parsed'], "{}_original_parsed.conllu".format(prefix))
+    udon2.ConllWriter.write_to_file(ind['gold'], os.path.join(results_dir, "{}_original_gold.conllu".format(prefix)))
+    udon2.ConllWriter.write_to_file(ind['parsed'], os.path.join(results_dir, "{}_original_parsed.conllu".format(prefix)))
 
-    udon2.ConllWriter.write_to_file(outd['gold'], "{}_augmented_gold.conllu".format(prefix))
-    udon2.ConllWriter.write_to_file(outd['parsed'], "{}_augmented_parsed.conllu".format(prefix))
+    udon2.ConllWriter.write_to_file(outd['gold'], os.path.join(results_dir, "{}_augmented_gold.conllu".format(prefix)))
+    udon2.ConllWriter.write_to_file(outd['parsed'],os.path.join(results_dir,  "{}_augmented_parsed.conllu".format(prefix)))
 
     del r['original']['gold']
     del r['original']['parsed']
@@ -224,4 +226,5 @@ if __name__ == '__main__':
             round(outd['corr_parsed'] * 100 / (outd['total'] - outd['wrong_sent_segm']), 2),
             outd['corr_parsed'], outd['total'] - outd['wrong_sent_segm'], outd['wrong_sent_segm'])
     ]
-    json.dump(r, open("{}.json".format(prefix), 'w'))
+
+    json.dump( r, open( os.path.join(results_dir, "{}.json".format(prefix)), 'w' ) )
