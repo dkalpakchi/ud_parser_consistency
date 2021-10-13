@@ -37,11 +37,11 @@ if __name__ == '__main__':
                 finalists.append((t, match))
 
         # Years used for testing later
-        rng = default_rng(7919) # seed sequence is set the same for reproducibility -- 100th prime number
+        rng = default_rng(7919) # seed sequence is set the same for reproducibility -- 1000th prime number
         test_years = rng.integers(1100, 2100, size=(50,))
 
         # Years used for training
-        rng = default_rng(7907) # seed sequence is set the same for reproducibility -- 99th prime number
+        rng = default_rng(7907) # seed sequence is set the same for reproducibility -- 999th prime number
         train_years = rng.integers(1100, 2100, size=(100,))
         train_years = [y for y in train_years if y not in test_years]
         print("Found {} years for augmentation".format(len(train_years)))

@@ -1,8 +1,10 @@
 import argparse
 import re
 import os
+import sys
 import glob
 import json
+import traceback
 from collections import defaultdict
 from pathlib import Path
 from pprint import pprint
@@ -15,6 +17,11 @@ from udon2.visual import render_dep_tree
 from udon2.kernels import ConvPartialTreeKernel
 
 
+def exclude_mwts(stanza_obj):
+    return [[w for w in sent if type(w['id']) == int] for sent in stanza_obj]
+
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-t', '--treebank', type=str, required=True, help="A path to UD treebank")
@@ -24,15 +31,30 @@ if __name__ == '__main__':
 
     base_dir = '/home/dmytro/oss/stanza/saved_models'
 
-    dep_proc = 'tokenize,lemma,mwt,pos,depparse' if args.language in ['fi', 'ar'] else 'tokenize,lemma,pos,depparse'
+    mwt_required = ['uk']
+    dep_proc = 'tokenize,lemma,mwt,pos,depparse' if args.language in mwt_required else 'tokenize,lemma,pos,depparse'
     if args.augmented_parser:
-        ud_parser = stanza.Pipeline(
-            lang=args.language, processors=dep_proc,
-            tokenize_model_path=glob.glob(os.path.join(base_dir, 'tokenize', '{}_*_tokenizer.pt'.format(args.language)))[0],
-            depparse_model_path=glob.glob(os.path.join(base_dir, 'depparse', '{}_*_parser.pt'.format(args.language)))[0],
-            pos_model_path=glob.glob(os.path.join(base_dir, 'pos', '{}_*_tagger.pt'.format(args.language)))[0],
-            lemma_model_path=glob.glob(os.path.join(base_dir, 'lemma', '{}_*_lemmatizer.pt'.format(args.language)))[0]
-        )
+        # for some reason they don't need MWT for the pretrained English models
+        # maybe because they trained on combined treebanks and not all of them have MWT?
+        mwt_required.append('en') 
+
+        if args.language in mwt_required:
+            ud_parser = stanza.Pipeline(
+                lang=args.language, processors=dep_proc,
+                tokenize_model_path=glob.glob(os.path.join(base_dir, 'tokenize', '{}_*_tokenizer.pt'.format(args.language)))[0],
+                depparse_model_path=glob.glob(os.path.join(base_dir, 'depparse', '{}_*_parser.pt'.format(args.language)))[0],
+                pos_model_path=glob.glob(os.path.join(base_dir, 'pos', '{}_*_tagger.pt'.format(args.language)))[0],
+                lemma_model_path=glob.glob(os.path.join(base_dir, 'lemma', '{}_*_lemmatizer.pt'.format(args.language)))[0],
+                mwt_model_path=glob.glob(os.path.join(base_dir, 'mwt', '{}_*_mwt_expander.pt'.format(args.language)))[0]
+            )
+        else:
+            ud_parser = stanza.Pipeline(
+                lang=args.language, processors=dep_proc,
+                tokenize_model_path=glob.glob(os.path.join(base_dir, 'tokenize', '{}_*_tokenizer.pt'.format(args.language)))[0],
+                depparse_model_path=glob.glob(os.path.join(base_dir, 'depparse', '{}_*_parser.pt'.format(args.language)))[0],
+                pos_model_path=glob.glob(os.path.join(base_dir, 'pos', '{}_*_tagger.pt'.format(args.language)))[0],
+                lemma_model_path=glob.glob(os.path.join(base_dir, 'lemma', '{}_*_lemmatizer.pt'.format(args.language)))[0]
+            )
     else:
         ud_parser = stanza.Pipeline(lang=args.language, processors=dep_proc)
 
@@ -60,6 +82,7 @@ if __name__ == '__main__':
         'original': {
             'total': len(finalists),
             'corr_parsed': 0,
+            'assertion_errors': 0,
             'gold': udon2.TreeList(),
             'parsed': udon2.TreeList(),
             'wrong_sent_segm': 0,
@@ -68,6 +91,7 @@ if __name__ == '__main__':
         'augmented': {
             'total': 0,
             'corr_parsed': 0,
+            'assertion_errors': 0,
             'same_as_first': 0,
             'gold': udon2.TreeList(),
             'parsed': udon2.TreeList(),
@@ -89,7 +113,14 @@ if __name__ == '__main__':
 
     for batch_id, (f, match) in enumerate(finalists):
         sentence = f.get_subtree_text()
-        trees = udon2.Importer.from_stanza(ud_parser(sentence).to_dict())
+
+        try:
+            trees = udon2.Importer.from_stanza(exclude_mwts(ud_parser(sentence).to_dict()))
+        except AssertionError as e:
+            # This will fire most probably if MWT module is necessary
+            print("Original assertion error:", sentence)
+            print(traceback.format_exc())
+            r['original']['assertion_errors'] += 1
 
         if len(trees) > 1:
             r['original']['wrong_sent_segm'] += 1
@@ -111,6 +142,7 @@ if __name__ == '__main__':
         first, f1 = None, f.copy()
         batch = {
             'total': 0,
+            'assertion_errors': 0,
             'corr_parsed': 0,
             'same_as_first': 0,
             'wrong_sent_segm': 0,
@@ -138,8 +170,15 @@ if __name__ == '__main__':
             # which exact occurences of the number were replaced, since there can be some compounds
             # like 1960s, which won't be found by regex or select_by if the target is 1960
             # however, this will get replaced by string.replace or re.sub
-            new_sentence = f1.get_subtree_text() 
-            trees = udon2.Importer.from_stanza(ud_parser(new_sentence).to_dict())
+            new_sentence = f1.get_subtree_text()
+            try:
+                trees = udon2.Importer.from_stanza(exclude_mwts(ud_parser(new_sentence).to_dict()))
+            except AssertionError as e:
+                # This will fire most probably if MWT module is necessary
+                print("Augmented assertion error:", new_sentence)
+                print(traceback.format_exc())
+                batch['assertion_errors'] += 1
+                r['augmented']['assertion_errors'] += 1
 
             r['augmented']['total'] += 1
 
