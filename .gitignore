@@ -2,3 +2,6 @@ __pycache__/
 UD_*/
 old_results/
 results/
+ud_*/
+*_results/
+run_*.sh

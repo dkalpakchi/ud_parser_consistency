@@ -27,9 +27,14 @@ if __name__ == '__main__':
     parser.add_argument('-t', '--treebank', type=str, required=True, help="A path to UD treebank")
     parser.add_argument('-l', '--language', type=str, required=True, help="Language")
     parser.add_argument('-ap', '--augmented-parser', action='store_true')
+    parser.add_argument('--tokens', action='store_true', help="Indicator that a parser is trained with NNNN tokens")
+    parser.add_argument('--visualize-wrong-segmentations', '-vws', action='store_true',
+        help='Visualize all trees with a wrong sentence segmentation')
+    parser.add_argument('--base-dir', '-b', type=str, default=Path.home().joinpath('stanza', 'saved_models'))
     args = parser.parse_args()
 
-    base_dir = '/home/dmytro/oss/stanza/saved_models'
+    base_dir = args.base_dir
+    print("Looking for models at {}".format(base_dir))
 
     mwt_required = ['uk']
     dep_proc = 'tokenize,lemma,mwt,pos,depparse' if args.language in mwt_required else 'tokenize,lemma,pos,depparse'
@@ -60,22 +65,30 @@ if __name__ == '__main__':
 
     prefix = Path(args.treebank).stem
 
-    YEAR = re.compile(r"(?<= )\d{4}(?= )")
-
     kernel = ConvPartialTreeKernel("GRCT", includeFeats=True, includeForm=False)
 
     trees = udon2.Importer.from_conll_file(args.treebank)
     print("Total # of trees: {}".format(len(trees)))
 
     finalists = []
-    for t in trees:
-    	match = YEAR.search(t.get_subtree_text())
-    	if match:
-    		finalists.append((t, match))
+    if args.tokens:
+        YEAR_TOKEN = re.compile(r"NNNN")
+        for t in trees:
+            match = YEAR_TOKEN.search(t.get_subtree_text())
+            if match:
+                finalists.append((t, match))
 
-    K = 50
-    rng = default_rng(7919) # seed sequence is set the same for reproducibility
-    years = rng.integers(1100, 2100, size=(K,))
+        years = []  # we don't do any replacement
+    else:
+        YEAR = re.compile(r"(?<= )\d{4}(?= )")
+        for t in trees:
+        	match = YEAR.search(t.get_subtree_text())
+        	if match:
+        		finalists.append((t, match))
+
+        K = 50
+        rng = default_rng(7919) # seed sequence is set the same for reproducibility
+        years = rng.integers(1100, 2100, size=(K,))
 
     # report variable
     r = {
@@ -124,6 +137,10 @@ if __name__ == '__main__':
 
         if len(trees) > 1:
             r['original']['wrong_sent_segm'] += 1
+            print("[Wrong segmentation]\t", sentence)
+            if args.visualize_wrong_segmentations:
+                for j, wrong_tree in enumerate(trees):
+                    render_dep_tree(wrong_tree, "original_wss_{}_{}.svg".format(r['original']['wrong_sent_segm'], j))
             continue
         else:
             tree = trees[0]
@@ -217,32 +234,30 @@ if __name__ == '__main__':
                 batch['deprel'][n1.deprel][n2.deprel] += 1
                 batch['feats'][str(n1.feats)][str(n2.feats)] += 1
 
-        # if batch['original_match']:
-        #     del batch['conv_kernel_matrix']
-        # else:
         NB = len(batch_parsed_trees)
-        batch['conv_kernel_matrix'] = np.zeros((NB, NB))
-        for i in range(NB):
-            for j in range(i, NB):
-                if i == j:
-                    batch['conv_kernel_matrix'][i][j] = 1.0
-                else:
-                    t1, t2 = batch_parsed_trees[i], batch_parsed_trees[j]
-                    ck = kernel(t1, t2)
-                    if np.isfinite(ck) and np.isfinite(precomputed_norms[i]) and np.isfinite(precomputed_norms[j]):
-                        batch['conv_kernel_matrix'][i][j] = round(
-                            float(ck / (np.sqrt(precomputed_norms[i]) * np.sqrt(precomputed_norms[j]))), 4)
+        if NB > 0:
+            batch['conv_kernel_matrix'] = np.zeros((NB, NB))
+            for i in range(NB):
+                for j in range(i, NB):
+                    if i == j:
+                        batch['conv_kernel_matrix'][i][j] = 1.0
                     else:
-                        batch['conv_kernel_matrix'][i][j] = -1
-        same_as_first_cnt = int(sum(batch['conv_kernel_matrix'][0][1:] == 1))
-        r['augmented']['same_as_first'] += same_as_first_cnt
-        batch['same_as_first'] += same_as_first_cnt
-        batch['conv_kernel_matrix'] = batch['conv_kernel_matrix'].tolist()
-        
-        udon2.ConllWriter.write_to_file(batch_parsed_trees, os.path.join(
-            batches_dir, "{}_augmented_parsed_b{}.conllu".format(prefix, batch_id)
-        ))
-        r['augmented']['batches'].append(batch)
+                        t1, t2 = batch_parsed_trees[i], batch_parsed_trees[j]
+                        ck = kernel(t1, t2)
+                        if np.isfinite(ck) and np.isfinite(precomputed_norms[i]) and np.isfinite(precomputed_norms[j]):
+                            batch['conv_kernel_matrix'][i][j] = round(
+                                float(ck / (np.sqrt(precomputed_norms[i]) * np.sqrt(precomputed_norms[j]))), 4)
+                        else:
+                            batch['conv_kernel_matrix'][i][j] = -1
+            same_as_first_cnt = int(sum(batch['conv_kernel_matrix'][0][1:] == 1))
+            r['augmented']['same_as_first'] += same_as_first_cnt
+            batch['same_as_first'] += same_as_first_cnt
+            batch['conv_kernel_matrix'] = batch['conv_kernel_matrix'].tolist()
+            
+            udon2.ConllWriter.write_to_file(batch_parsed_trees, os.path.join(
+                batches_dir, "{}_augmented_parsed_b{}.conllu".format(prefix, batch_id)
+            ))
+            r['augmented']['batches'].append(batch)
 
     ind, outd = r['original'], r['augmented']
     udon2.ConllWriter.write_to_file(ind['gold'], os.path.join(results_dir, "{}_original_gold.conllu".format(prefix)))
@@ -260,10 +275,13 @@ if __name__ == '__main__':
     r['comments'] = [
         "Correct: {}% ({} out of {}, skipped {} with wrong sentence segmentation)".format(
             round(ind['corr_parsed'] * 100 / (ind['total'] - ind['wrong_sent_segm']), 2),
-            ind['corr_parsed'], ind['total'] - ind['wrong_sent_segm'], ind['wrong_sent_segm']),
-        "Correct (aug): {}% ({} out of {}, skipped {} with wrong sentence segmentation)".format(
-            round(outd['corr_parsed'] * 100 / (outd['total'] - outd['wrong_sent_segm']), 2),
-            outd['corr_parsed'], outd['total'] - outd['wrong_sent_segm'], outd['wrong_sent_segm'])
+            ind['corr_parsed'], ind['total'] - ind['wrong_sent_segm'], ind['wrong_sent_segm'])
     ]
+
+    if outd['total'] - outd['wrong_sent_segm'] > 0:
+        # if --tokens, then we don't augment anything!
+        r['comments'].append("Correct (aug): {}% ({} out of {}, skipped {} with wrong sentence segmentation)".format(
+            round(outd['corr_parsed'] * 100 / (outd['total'] - outd['wrong_sent_segm']), 2),
+            outd['corr_parsed'], outd['total'] - outd['wrong_sent_segm'], outd['wrong_sent_segm']))
 
     json.dump( r, open( os.path.join(results_dir, "{}.json".format(prefix)), 'w' ) )

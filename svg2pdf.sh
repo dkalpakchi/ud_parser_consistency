@@ -1,4 +1,4 @@
-for i in `seq 1 10`
+for f in `ls *.svg`
 do
-	inkscape max_cluster_"$i".svg --export-area-page --batch-process --export-type=pdf --export-filename=max_cluster_"$i".pdf
+	inkscape "$f" --export-area-page --batch-process --export-type=pdf --export-filename=`$(basename -- "$f")`.pdf
 done

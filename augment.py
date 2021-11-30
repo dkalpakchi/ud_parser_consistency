@@ -31,12 +31,14 @@ if __name__ == '__main__':
         comments = []
 
         finalists = []
-        for t in trees:
+        to_replace = []
+        for i, t in enumerate(trees):
             sent = t.get_subtree_text()
             comments.append(sent)
             match = YEAR.search(sent)
             if match:
                 finalists.append((t, match))
+                to_replace.append(i)
 
         if args.numerals:
             # Years used for testing later
@@ -54,7 +56,7 @@ if __name__ == '__main__':
         else:
             raise ValueError("Either --numerals or --tokens should be supplied to the script")
 
-        for f, match in finalists:
+        for i, (f, match) in enumerate(finalists):
             sentence = f.get_subtree_text()
             s, e = match.span()
             current_year = sentence[s:e]
@@ -76,8 +78,11 @@ if __name__ == '__main__':
                 for node in nodes:
                     node.form = YEAR_TOKEN
                     node.lemma = YEAR_TOKEN
-                trees.append(f1)
-                comments.append(f1.get_subtree_text())
+                trees[to_replace[i]] = f1
+                comments[to_replace[i]] = f1.get_subtree_text()
+
+        if args.tokens:
+            print("Replaced {} 4-digit numerals with {} token".format(len(to_replace), YEAR_TOKEN))
 
         print("Total # of trees after augmentation: {}".format(len(trees)))
         augm_type = "tokens" if args.tokens else "numerals"
